@@ -1,0 +1,236 @@
+-- 刪除舊表（如果有的話）
+DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS categories;
+
+-- 1. 建立分類表
+CREATE TABLE categories (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE
+);
+
+-- 2. 建立商品主表（包含規格 JSONB）
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    category_id INT REFERENCES categories(id) ON DELETE RESTRICT,
+    name VARCHAR(255) NOT NULL,
+    brand VARCHAR(100) NOT NULL,
+    price DECIMAL(10, 2) NOT NULL,
+    stock INT NOT NULL DEFAULT 0,
+    specifications JSONB NOT NULL DEFAULT '{}', -- 儲存動態硬體規格
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 建立 JSONB 索引提升搜尋效能
+CREATE INDEX idx_products_specs ON products USING gin (specifications);
+
+-- 3. 塞入初始分類資料
+INSERT INTO categories (id, name) VALUES 
+(1, 'CPU'), 
+(2, 'Motherboard'), 
+(3, 'GPU'), 
+(4, 'Case');
+
+-- 4. 塞入測試商品資料（注意每個零件的 specifications 內容都不同）
+INSERT INTO products (category_id, name, brand, price, stock, specifications) VALUES
+(1, 'Intel Core i5-14600K', 'Intel', 10500.00, 20, '{"socket": "LGA1700", "cores": 14, "tdp_watts": 125}'),
+(1, 'AMD Ryzen 7 7800X3D', 'AMD', 12200.00, 15, '{"socket": "AM5", "cores": 8, "tdp_watts": 120}'),
+(2, 'ASUS ROG STRIX Z790-A', 'ASUS', 9990.00, 8, '{"socket": "LGA1700", "chipset": "Z790", "form_factor": "ATX"}'),
+(2, 'GIGABYTE B650 AORUS ELITE', 'GIGABYTE', 6490.00, 12, '{"socket": "AM5", "chipset": "B650", "form_factor": "ATX"}'),
+(3, 'ASUS Dual RTX 4070 SUPER', 'ASUS', 21990.00, 5, '{"length_mm": 267, "recommended_psu_watts": 650}'),
+(3, 'MSI RTX 4090 SUPRIM X', 'MSI', 63900.00, 2, '{"length_mm": 336, "recommended_psu_watts": 850}'),
+(4, 'Corsair 4000D Airflow', 'Corsair', 3290.00, 25, '{"max_gpu_length_mm": 360, "supported_motherboards": ["ATX", "Micro-ATX"]}'),
+(4, 'SAMA IM01 Small Case', 'SAMA', 1690.00, 10, '{"max_gpu_length_mm": 300, "supported_motherboards": ["Micro-ATX", "Mini-ITX"]}');
+
+{
+  "name": "pc-parts-backend",
+  "version": "1.0.0",
+  "description": "PC Parts E-commerce Backend API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.11.5",
+    "dotenv": "^16.4.5"
+  }
+}
+
+PORT=3000
+DB_USER=postgres
+DB_HOST=localhost
+DB_NAME=pc_store
+DB_PASSWORD=你的資料庫密碼
+DB_PORT=5432
+
+
+const express = require('express');
+const { Pool } = require('pg');
+require('dotenv').config();
+
+const app = express();
+app.use(express.json()); // 允許 Express 解析 JSON 請求
+
+// 初始化 PostgreSQL 連線池
+const pool = new Pool({
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT,
+});
+
+// 測試資料庫連線狀況
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('❌ 資料庫連線失敗，請檢查 .env 設定:', err.stack);
+  } else {
+    console.log(' PostgreSQL 資料庫連線成功！');
+  }
+});
+
+/**
+ * [GET] /api/products
+ * 功能：取得商品列表（可透過 category_id 過濾）
+ * 範例：http://localhost:3000/api/products?category_id=1
+ */
+app.get('/api/products', async (req, res) => {
+  try {
+    const { category_id } = req.query;
+    let query = 'SELECT p.*, c.name as category_name FROM products p JOIN categories c ON p.category_id = c.id';
+    const params = [];
+
+    if (category_id) {
+      query += ' WHERE p.category_id = $1';
+      params.push(category_id);
+    }
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: '伺服器發生錯誤' });
+  }
+});
+
+/**
+ * [POST] /api/products
+ * 功能：上架新零件（支援帶入動態 JSONB 規格）
+ * Body 範例：參見下方測試說明
+ */
+app.post('/api/products', async (req, res) => {
+  const { category_id, name, brand, price, stock, specifications } = req.body;
+  
+  if (!category_id || !name || !brand || !price) {
+    return res.status(400).json({ error: '缺少必要欄位（category_id, name, brand, price）' });
+  }
+
+  try {
+    const query = `
+      INSERT INTO products (category_id, name, brand, price, stock, specifications)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING *;
+    `;
+    // pg 套件會自動將 JavaScript Object 轉換為資料庫所需的 JSONB 格式
+    const values = [category_id, name, brand, price, stock || 0, specifications || {}];
+    const result = await pool.query(query, values);
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: '商品上架失敗' });
+  }
+});
+
+/**
+ * [GET] /api/compatibility/cpus
+ * 功能：【DIY相容性】依據使用者選擇的主機板腳位，自動過濾出可安裝的 CPU
+ * 範例：http://localhost:3000/api/compatibility/cpus?socket=AM5
+ */
+app.get('/api/compatibility/cpus', async (req, res) => {
+  const { socket } = req.query; 
+  
+  if (!socket) {
+    return res.status(400).json({ error: '請提供主機板的 socket 腳位以進行比對' });
+  }
+
+  try {
+    // 使用 JSONB 運算子 ->> 提取 JSON 內部的值進行比對
+    const query = `
+      SELECT p.* FROM products p
+      JOIN categories c ON p.category_id = c.id
+      WHERE c.name = 'CPU' AND p.specifications ->> 'socket' = $1;
+    `;
+    const result = await pool.query(query, [socket]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: '相容性查詢失敗' });
+  }
+});
+
+/**
+ * [GET] /api/compatibility/check-gpu-case
+ * 功能：【DIY相容性】檢查玩家選的顯示卡會不會太長，卡到機殼
+ * 範例：http://localhost:3000/api/compatibility/check-gpu-case?case_id=8&gpu_id=6
+ */
+app.get('/api/compatibility/check-gpu-case', async (req, res) => {
+  const { case_id, gpu_id } = req.query;
+
+  if (!case_id || !gpu_id) {
+    return res.status(400).json({ error: '請提供 case_id 與 gpu_id' });
+  }
+
+  try {
+    // 透過 SQL 一口氣撈出機殼限長與顯卡實際長度
+    const query = `
+      SELECT 
+        (SELECT specifications ->> 'max_gpu_length_mm' FROM products WHERE id = $1) as max_len,
+        (SELECT specifications ->> 'length_mm' FROM products WHERE id = $2) as gpu_len
+    `;
+    const result = await pool.query(query, [case_id, gpu_id]);
+    const { max_len, gpu_len } = result.rows[0];
+
+    if (!max_len || !gpu_len) {
+      return res.status(400).json({ error: '找不到該商品，或商品規格中缺少長度資訊' });
+    }
+
+    // 轉成數字進行大小比對
+    const isCompatible = parseInt(gpu_len) <= parseInt(max_len);
+
+    res.json({
+      compatible: isCompatible,
+      case_max_length_mm: parseInt(max_len),
+      gpu_length_mm: parseInt(gpu_len),
+      message: isCompatible 
+        ? '✅ 安全！這張顯示卡放得進去該機殼。' 
+        : `❌ 警報！顯示卡太長 (${gpu_len}mm)，該機殼最大只支援 ${max_len}mm！`
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: '檢查相容性時發生錯誤' });
+  }
+});
+
+// 啟動伺服器
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 電腦零件後端系統已啟動：http://localhost:${PORT}`);
+});
+
+npm install
+
+npm start
+
+{
+  "category_id": 1,
+  "name": "Intel Core i9-14900KS",
+  "brand": "Intel",
+  "price": 22000,
+  "stock": 5,
+  "specifications": {
+    "socket": "LGA1700",
+    "cores": 24,
+    "tdp_watts": 150
+  }
+}
